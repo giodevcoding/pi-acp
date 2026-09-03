@@ -146,6 +146,28 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
 })
 
+test('PiAcpSession: extension command completes on RPC response without agent_settled', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const reason = await session.runExtensionCommand('/fh-system-prompt')
+
+  assert.equal(reason, 'end_turn')
+  assert.deepEqual(proc.prompts, [{ message: '/fh-system-prompt', attachments: [] }])
+  assert.deepEqual(
+    conn.updates.map(item => item.update.sessionUpdate),
+    ['session_info_update', 'session_info_update']
+  )
+})
+
 test('PiAcpSession: handles extension select via ACP permission request', async () => {
   const conn = new FakeAgentSideConnection()
   conn.nextPermissionResponse = { outcome: { outcome: 'selected', optionId: 'choice-1' } }
