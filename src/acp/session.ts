@@ -372,6 +372,39 @@ export class PiAcpSession {
     return turnPromise
   }
 
+  /** Execute a Pi extension command through RPC without waiting for agent_settled.
+   * Extension handlers may run child agents and extension UI requests, but the parent
+   * Pi session does not start an agent loop for the command itself. The RPC response is
+   * therefore the authoritative completion boundary.
+   */
+  async runExtensionCommand(message: string): Promise<StopReason> {
+    if (this.pendingTurn) {
+      throw RequestError.invalidParams('Cannot start an extension command while an agent turn is running')
+    }
+
+    this.cancelRequested = false
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth: 0, running: true, extensionCommand: message.split(/\s+/, 1)[0] } }
+    })
+
+    try {
+      await this.proc.prompt(message, [])
+      await this.flushEmits()
+      return this.cancelRequested ? 'cancelled' : 'end_turn'
+    } catch (error) {
+      const authError = maybeAuthRequiredError(error)
+      if (authError) throw authError
+      return this.cancelRequested ? 'cancelled' : 'error'
+    } finally {
+      this.emit({
+        sessionUpdate: 'session_info_update',
+        _meta: { piAcp: { queueDepth: 0, running: false } }
+      })
+      await this.flushEmits()
+    }
+  }
+
   async cancel(): Promise<void> {
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true
