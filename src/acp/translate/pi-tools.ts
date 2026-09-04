@@ -1,3 +1,55 @@
+import type { ToolKind } from '@agentclientprotocol/sdk'
+
+export function toToolKind(toolName: string): ToolKind {
+  switch (toolName) {
+    case 'read':
+      return 'read'
+    case 'write':
+    case 'edit':
+      return 'edit'
+    case 'bash':
+      return 'execute'
+    case 'grep':
+    case 'find':
+    case 'ls':
+      return 'search'
+    default:
+      return 'other'
+  }
+}
+
+function argString(args: unknown, key: string): string | undefined {
+  const value = (args as Record<string, unknown> | null | undefined)?.[key]
+  return typeof value === 'string' ? value : undefined
+}
+
+function toolTitleFor(toolName: string, args: unknown): string {
+  const path = argString(args, 'path') ?? argString(args, 'file_path')
+
+  switch (toolName) {
+    case 'read':
+    case 'write':
+    case 'edit':
+      return path ?? toolName
+    case 'grep':
+    case 'find': {
+      const pattern = argString(args, 'pattern')
+      if (!pattern) return toolName
+      const scope = path ?? argString(args, 'glob')
+      return scope ? `${pattern} in ${scope}` : pattern
+    }
+    case 'ls':
+      return path ?? '.'
+    default:
+      return toolName
+  }
+}
+
+/** One-line title for ACP tool calls, derived from pi tool args when available. */
+export function toolTitle(toolName: string, args: unknown): string {
+  return toolTitleFor(toolName, args).replace(/\s+/g, ' ').trim()
+}
+
 export function toolResultToText(result: unknown): string {
   if (!result) return ''
 

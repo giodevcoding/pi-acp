@@ -18,6 +18,9 @@ Expect some minor breaking changes.
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
+  - For `edit`/`write`, `pi-acp` also emits an in-progress **projected diff** while the tool runs (derived from the pre-edit snapshot and the requested args); it is superseded by the realized diff on completion
+  - Tool calls are titled from their args (e.g. `read` shows the file path, `grep`/`find` show the search pattern) and mapped to ACP kinds (`read`, `edit`, `search` for `grep`/`find`/`ls`, `execute` for `bash`)
+- Pi extension permission requests (e.g. edit approval gates) are attributed to the in-flight `edit`/`write` tool call when there is one, so clients attach the permission UI to the real tool call block with its diff; option names like "Allow once"/"Deny" map to ACP `allow_once`/`reject_once` semantics
 - Session persistence
   - pi stores its own sessions in `~/.pi/agent/sessions/...`
   - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so `session/load` can reattach to a previous pi session file

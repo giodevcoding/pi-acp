@@ -5,8 +5,7 @@ import type {
   PermissionOption,
   SessionUpdate,
   ToolCallContent,
-  ToolCallLocation,
-  ToolKind
+  ToolCallLocation
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import { readFileSync } from 'node:fs'
@@ -26,7 +25,7 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toolResultToText, toolTitle, toToolKind } from './translate/pi-tools.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -51,6 +50,13 @@ type QueuedTurn = {
 }
 
 type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
+
+type ActiveFileMutation = {
+  toolCallId: string
+  toolName: string
+  args: unknown
+  locations?: ToolCallLocation[]
+}
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
@@ -137,6 +143,27 @@ function getEditOldTexts(args: unknown): string[] {
   }
 
   return oldTexts
+}
+
+// Best-effort preview of the post-mutation content while the tool is still running.
+// Exact match only; pi's fuzzy matching is reflected by the realized diff at completion.
+function projectNewContent(oldText: string | null, toolName: string, args: unknown): string | null {
+  if (toolName === 'write') {
+    const content = (args as { content?: unknown } | null | undefined)?.content
+    return typeof content === 'string' ? content : null
+  }
+
+  if (toolName !== 'edit' || oldText === null) return null
+
+  const edits = getParsedEdits(args)
+  if (!edits.length) return null
+
+  let projected = oldText
+  for (const edit of edits) {
+    if (!projected.includes(edit.oldText)) return null
+    projected = projected.replace(edit.oldText, () => edit.newText)
+  }
+  return projected
 }
 
 function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
@@ -289,6 +316,9 @@ export class PiAcpSession {
   // events may need to be implemented in pi in the future.
   private fileSnapshots = new Map<string, { path: string; oldText: string | null }>()
   private fileMutationToolCallIds = new Set<string>()
+  // The in-flight edit/write call, used to attribute pi extension permission
+  // requests to the real tool call (instead of a synthetic pi-ui one).
+  private activeFileMutation: ActiveFileMutation | null = null
   private bashToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
 
@@ -496,16 +526,42 @@ export class PiAcpSession {
     })
   }
 
+  /** Emit an in-progress projected diff for the active edit/write tool call. */
+  private emitProjectedDiff(toolCallId: string): void {
+    const mutation = this.activeFileMutation
+    const snapshot = this.fileSnapshots.get(toolCallId)
+    if (!mutation || !snapshot) return
+
+    const projected = projectNewContent(snapshot.oldText, mutation.toolName, mutation.args)
+    if (projected === null || projected === snapshot.oldText) return
+
+    this.emit({
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: 'in_progress',
+      content: [
+        {
+          type: 'diff',
+          path: snapshot.path,
+          oldText: snapshot.oldText,
+          newText: projected
+        }
+      ] satisfies ToolCallContent[]
+    })
+  }
+
   private cleanupToolCall(toolCallId: string): void {
     this.currentToolCalls.delete(toolCallId)
     this.fileSnapshots.delete(toolCallId)
     this.fileMutationToolCallIds.delete(toolCallId)
+    if (this.activeFileMutation?.toolCallId === toolCallId) this.activeFileMutation = null
     this.bashToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
+    this.activeFileMutation = null
     this.inAgentLoop = false
 
     this.pendingTurn = { resolve: t.resolve, reject: t.reject }
@@ -617,18 +673,19 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: toolName,
+                title: toolTitle(toolName, rawInput),
                 kind: toToolKind(toolName),
                 status,
                 locations,
                 rawInput
               })
             } else {
-              // Best-effort: keep rawInput updated while args are streaming.
+              // Best-effort: keep rawInput and title updated while args are streaming.
               // Keep the existing status (pending or in_progress).
               this.emit({
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
+                title: toolTitle(toolName, rawInput),
                 status,
                 locations,
                 rawInput
@@ -691,6 +748,7 @@ export class PiAcpSession {
         }
 
         const locations = toToolCallLocations(args, this.cwd, line)
+        const title = toolTitle(toolName, args)
 
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {
@@ -698,7 +756,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
+            title,
             kind: toToolKind(toolName),
             status: 'in_progress',
             locations,
@@ -709,10 +767,16 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call_update',
             toolCallId,
+            title,
             status: 'in_progress',
             locations,
             rawInput: args
           })
+        }
+
+        if (isFileMutation) {
+          this.activeFileMutation = { toolCallId, toolName, args, locations }
+          this.emitProjectedDiff(toolCallId)
         }
 
         break
@@ -951,11 +1015,18 @@ export class PiAcpSession {
       return
     }
 
-    const permissionOptions: PermissionOption[] = options.map((name, index) => ({
-      optionId: `${CHOICE_OPTION_PREFIX}${index}`,
-      name,
-      kind: 'allow_once'
-    }))
+    const attributed = this.activeFileMutation !== null
+    const permissionOptions: PermissionOption[] = attributed
+      ? permissionOptionsForNames(options)
+      : options.map((name, index) => ({
+          optionId: `${CHOICE_OPTION_PREFIX}${index}`,
+          name,
+          kind: 'allow_once'
+        }))
+
+    const optionIndexById = attributed
+      ? new Map(permissionOptions.map((option, index) => [option.optionId, index]))
+      : null
 
     const selected = await this.requestExtensionPermission(id, ev, permissionOptions)
     if (selected === null) {
@@ -963,7 +1034,8 @@ export class PiAcpSession {
     }
 
     const selectedOptionId = selected.outcome.outcome === 'selected' ? selected.outcome.optionId : null
-    const index = selectedOptionId === null ? null : optionIndex(selectedOptionId)
+    const index =
+      selectedOptionId === null ? null : (optionIndexById?.get(selectedOptionId) ?? optionIndex(selectedOptionId))
     const value = index === null ? null : (options.at(index) ?? null)
     await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
   }
@@ -990,13 +1062,32 @@ export class PiAcpSession {
     try {
       return await this.conn.requestPermission({
         sessionId: this.sessionId,
-        toolCall: extensionUiToolCall(id, ev),
+        toolCall: this.permissionToolCall(id, ev),
         options
       })
     } catch {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return null
     }
+  }
+
+  // Attribute the request to the in-flight edit/write tool call when there is one, so
+  // clients can attach the permission UI to the real tool call block (and its diff).
+  private permissionToolCall(id: string, ev: PiRpcEvent) {
+    const mutation = this.activeFileMutation
+    if (mutation) {
+      const method = stringProp(ev, 'method') ?? 'ui'
+      return {
+        toolCallId: mutation.toolCallId,
+        title: stringProp(ev, 'title') ?? `Pi ${method}`,
+        kind: toToolKind(mutation.toolName),
+        status: 'pending' as const,
+        rawInput: mutation.args,
+        ...(mutation.locations ? { locations: mutation.locations } : {})
+      }
+    }
+
+    return extensionUiToolCall(id, ev)
   }
 }
 
@@ -1021,6 +1112,30 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
 function stringProp(source: Record<string, unknown>, key: string): string | null {
   const value = source[key]
   return typeof value === 'string' ? value : null
+}
+
+// Map pi extension option names onto ACP permission semantics. Deny takes
+// precedence over "always" so e.g. "Always reject" maps to reject_always.
+function mappedPermissionOption(name: string): { optionId: string; kind: PermissionOption['kind'] } | null {
+  if (/\b(deny|reject|no|cancel)\b/i.test(name)) {
+    return /always/i.test(name)
+      ? { optionId: 'reject_always', kind: 'reject_always' }
+      : { optionId: 'reject_once', kind: 'reject_once' }
+  }
+  if (/always/i.test(name)) return { optionId: 'allow_always', kind: 'allow_always' }
+  if (/\b(allow|approve|yes|ok)/i.test(name)) return { optionId: 'allow_once', kind: 'allow_once' }
+  return null
+}
+
+function permissionOptionsForNames(names: string[]): PermissionOption[] {
+  const usedOptionIds = new Set<string>()
+  return names.map((name, index) => {
+    const mapped = mappedPermissionOption(name)
+    const kind = mapped?.kind ?? 'allow_once'
+    const optionId = mapped && !usedOptionIds.has(mapped.optionId) ? mapped.optionId : `${CHOICE_OPTION_PREFIX}${index}`
+    usedOptionIds.add(optionId)
+    return { optionId, name, kind }
+  })
 }
 
 function optionIndex(optionId: string): number | null {
@@ -1050,18 +1165,4 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
-}
-
-function toToolKind(toolName: string): ToolKind {
-  switch (toolName) {
-    case 'read':
-      return 'read'
-    case 'write':
-    case 'edit':
-      return 'edit'
-    case 'bash':
-      return 'execute'
-    default:
-      return 'other'
-  }
 }

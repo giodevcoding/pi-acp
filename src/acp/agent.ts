@@ -29,7 +29,7 @@ import { SessionStore } from './session-store.js'
 import { PiRpcProcess } from '../pi-rpc/process.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
 import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { toolResultToText, toolTitle, toToolKind } from './translate/pi-tools.js'
 import {
   bashCommand,
   bashExitCode,
@@ -991,6 +991,10 @@ export class PiAcpAgent implements ACPAgent {
     const data = (await proc.getMessages()) as any
     const messages = Array.isArray(data?.messages) ? data.messages : []
 
+    // Historic tool call args live on assistant toolCall blocks; map them so
+    // replayed tool calls can be titled like live ones.
+    const toolCallArgs = new Map<string, unknown>()
+
     for (const m of messages) {
       const role = String(m?.role ?? '')
 
@@ -1008,6 +1012,14 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       if (role === 'assistant') {
+        if (Array.isArray(m?.content)) {
+          for (const block of m.content as any[]) {
+            if (block?.type === 'toolCall' && typeof block.id === 'string') {
+              toolCallArgs.set(block.id, block.arguments)
+            }
+          }
+        }
+
         const text = normalizePiAssistantText(m?.content)
         if (text) {
           await this.conn.sessionUpdate({
@@ -1062,8 +1074,8 @@ export class PiAcpAgent implements ACPAgent {
           update: {
             sessionUpdate: 'tool_call',
             toolCallId,
-            title: toolName,
-            kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
+            title: toolTitle(toolName, toolCallArgs.get(toolCallId)),
+            kind: toToolKind(toolName),
             status: 'completed',
             rawInput: null,
             rawOutput: m

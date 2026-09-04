@@ -64,7 +64,7 @@ test('PiAcpSession: emits ACP diff content for edit tool from actual before/afte
   assert.equal((end.update as any).rawOutput, undefined, 'expected raw output to be suppressed when diff is emitted')
 })
 
-test('PiAcpSession: does not turn requested edit args into finalized ACP diffs at tool start', async () => {
+test('PiAcpSession: emits projected in-progress diff at edit start, superseded by realized diff at end', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-'))
   mkdirSync(dir, { recursive: true })
   const filePath = join(dir, 'a.txt')
@@ -81,9 +81,19 @@ test('PiAcpSession: does not turn requested edit args into finalized ACP diffs a
 
   await new Promise(r => setTimeout(r, 0))
 
-  const start = conn.updates.find(u => (u.update as any).toolCallId === 't1' && u.update.sessionUpdate === 'tool_call')
-  assert.ok(start, 'expected tool_call for edit start')
-  assert.equal((start.update as any).content, undefined, 'expected no start-time diff from requested edit args')
+  const projection = conn.updates.find(
+    u =>
+      (u.update as any).toolCallId === 't1' &&
+      u.update.sessionUpdate === 'tool_call_update' &&
+      Array.isArray((u.update as any).content)
+  )
+  assert.ok(projection, 'expected in-progress projected diff update')
+  assert.equal((projection.update as any).status, 'in_progress')
+  const projectedDiff = (projection.update as any).content.find((c: any) => c.type === 'diff')
+  assert.ok(projectedDiff, 'expected projected diff content item')
+  assert.equal(projectedDiff.path, 'a.txt')
+  assert.equal(projectedDiff.oldText, 'before\n')
+  assert.equal(projectedDiff.newText, 'after\n')
 
   writeFileSync(filePath, 'after\n', 'utf8')
   proc.emit({
@@ -101,6 +111,32 @@ test('PiAcpSession: does not turn requested edit args into finalized ACP diffs a
   assert.ok(diff, 'expected diff content item')
   assert.equal(diff.oldText, 'before\n')
   assert.equal(diff.newText, 'after\n')
+})
+
+test('PiAcpSession: omits projected diff when edit oldText is not found in the file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-'))
+  mkdirSync(dir, { recursive: true })
+  const filePath = join(dir, 'a.txt')
+  writeFileSync(filePath, 'before\n', 'utf8')
+
+  const { conn, proc } = createSession(dir)
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'edit',
+    args: { path: 'a.txt', edits: [{ oldText: 'missing', newText: 'after' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const projection = conn.updates.find(
+    u =>
+      (u.update as any).toolCallId === 't1' &&
+      u.update.sessionUpdate === 'tool_call_update' &&
+      Array.isArray((u.update as any).content)
+  )
+  assert.equal(projection, undefined, 'expected no projected diff when oldText does not match')
 })
 
 test('PiAcpSession: edit diff uses realized fuzzy-match file contents instead of requested args', async () => {
@@ -156,9 +192,18 @@ test('PiAcpSession: emits write diff content from actual before/after file conte
 
   await new Promise(r => setTimeout(r, 0))
 
-  const start = conn.updates.find(u => (u.update as any).toolCallId === 't1' && u.update.sessionUpdate === 'tool_call')
-  assert.ok(start, 'expected tool_call for write start')
-  assert.equal((start.update as any).content, undefined, 'expected no start-time diff for write')
+  const projection = conn.updates.find(
+    u =>
+      (u.update as any).toolCallId === 't1' &&
+      u.update.sessionUpdate === 'tool_call_update' &&
+      Array.isArray((u.update as any).content)
+  )
+  assert.ok(projection, 'expected in-progress projected diff update for write')
+  const projectedDiff = (projection.update as any).content.find((c: any) => c.type === 'diff')
+  assert.ok(projectedDiff, 'expected projected diff content item')
+  assert.equal(projectedDiff.path, 'a.txt')
+  assert.equal(projectedDiff.oldText, 'before\n')
+  assert.equal(projectedDiff.newText, 'after\n')
 
   writeFileSync(filePath, 'after\n', 'utf8')
   proc.emit({
@@ -193,6 +238,20 @@ test('PiAcpSession: emits write diff content for new files on completion', async
     toolName: 'write',
     args: { path: 'new.txt', content: 'created\n' }
   })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const projection = conn.updates.find(
+    u =>
+      (u.update as any).toolCallId === 't1' &&
+      u.update.sessionUpdate === 'tool_call_update' &&
+      Array.isArray((u.update as any).content)
+  )
+  assert.ok(projection, 'expected in-progress projected diff update for new file')
+  const projectedDiff = (projection.update as any).content.find((c: any) => c.type === 'diff')
+  assert.ok(projectedDiff, 'expected projected diff content item')
+  assert.equal(projectedDiff.oldText, null)
+  assert.equal(projectedDiff.newText, 'created\n')
 
   writeFileSync(filePath, 'created\n', 'utf8')
   proc.emit({

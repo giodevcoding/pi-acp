@@ -530,6 +530,84 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
 })
 
+test('PiAcpSession: titles tool calls from args with mapped kinds', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const cases: Array<{ toolCallId: string; toolName: string; args: any; title: string; kind: string }> = [
+    { toolCallId: 'r1', toolName: 'read', args: { path: 'src/foo.ts' }, title: 'src/foo.ts', kind: 'read' },
+    { toolCallId: 'e1', toolName: 'edit', args: { path: 'src/foo.ts', edits: [] }, title: 'src/foo.ts', kind: 'edit' },
+    { toolCallId: 'w1', toolName: 'write', args: { path: 'new.txt', content: 'x' }, title: 'new.txt', kind: 'edit' },
+    { toolCallId: 'g1', toolName: 'grep', args: { pattern: 'foo', path: 'src' }, title: 'foo in src', kind: 'search' },
+    {
+      toolCallId: 'g2',
+      toolName: 'grep',
+      args: { pattern: 'foo', glob: '*.ts' },
+      title: 'foo in *.ts',
+      kind: 'search'
+    },
+    { toolCallId: 'f1', toolName: 'find', args: { pattern: '*.test.ts' }, title: '*.test.ts', kind: 'search' },
+    { toolCallId: 'l1', toolName: 'ls', args: {}, title: '.', kind: 'search' }
+  ]
+
+  for (const c of cases) {
+    proc.emit({ type: 'tool_execution_start', toolCallId: c.toolCallId, toolName: c.toolName, args: c.args })
+  }
+
+  await new Promise(r => setTimeout(r, 0))
+
+  cases.forEach(c => {
+    const update = conn.updates.find(
+      u => (u.update as any).toolCallId === c.toolCallId && u.update.sessionUpdate === 'tool_call'
+    )
+    assert.ok(update, `expected tool_call for ${c.toolCallId}`)
+    assert.equal((update!.update as any).title, c.title, c.toolCallId)
+    assert.equal((update!.update as any).kind, c.kind, c.toolCallId)
+  })
+})
+
+test('PiAcpSession: corrects streamed tool title once full args arrive', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: 't1', name: 'read', partialArgs: '{"path": "sr' }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'src/foo.ts' } })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  const streamed = conn.updates[0]!.update as any
+  assert.equal(streamed.sessionUpdate, 'tool_call')
+  assert.equal(streamed.title, 'read')
+  const transition = conn.updates[1]!.update as any
+  assert.equal(transition.sessionUpdate, 'tool_call_update')
+  assert.equal(transition.title, 'src/foo.ts')
+})
+
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -589,9 +667,14 @@ test('PiAcpSession: emits edit tool line from edits array when oldText matches u
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates.length, 2)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: filePath, line: 3 }])
+  const projection = conn.updates[1]!.update as any
+  assert.equal(projection.sessionUpdate, 'tool_call_update')
+  assert.deepEqual(projection.content, [
+    { type: 'diff', path: 'a.txt', oldText: 'one\ntwo\nneedle\nthree\n', newText: 'one\ntwo\nreplacement\nthree\n' }
+  ])
 })
 
 test('PiAcpSession: emits edit tool line from stringified edits array', async () => {
@@ -621,7 +704,7 @@ test('PiAcpSession: emits edit tool line from stringified edits array', async ()
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates.length, 2)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: filePath, line: 3 }])
 })
